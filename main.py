@@ -1,5 +1,6 @@
 import os
 import base64
+import asyncio
 from typing import Any
 
 import httpx
@@ -46,6 +47,12 @@ async def remove_buttons(chat_id: int, message_id: int):
             bot_url("editMessageReplyMarkup"),
             json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
         )
+
+
+async def delayed_remove_buttons(chat_id: int, message_id: int, delay: int = 300):
+    """Wait delay seconds then remove buttons."""
+    await asyncio.sleep(delay)
+    await remove_buttons(chat_id, message_id)
 
 
 # ── PayPal API ──
@@ -149,14 +156,14 @@ async def handle_package(chat_id, price, cb_id, msg_id):
     await answer_callback(cb_id, f"Wybrałeś pakiet za {price}zł")
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
-    await send_message(chat_id, f"Pakiet: <b>{pkg['label']}</b>\n\nWybierz metodę płatności:", payment_method_keyboard(price))
+    await send_message(chat_id, f"Pakiet: {pkg['label']}\n\nWybierz metodę płatności:", payment_method_keyboard(price))
 
 
 async def handle_blik(chat_id, price, cb_id, msg_id):
     await answer_callback(cb_id)
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
-    text = f"💳 <b>Płatność BLIK</b>\n\nPakiet: <b>{pkg['label']}</b>\n\nWyślij kwotę na numer:\n<b>533003463</b>\n\nPo dokonaniu płatności kliknij przycisk:"
+    text = f"💳 Płatność BLIK\n\nPakiet: {pkg['label']}\n\nWyślij kwotę na numer:\n533003463\n\nPo dokonaniu płatności kliknij przycisk:"
     await send_message(chat_id, text, blik_paid_keyboard(price))
 
 
@@ -166,10 +173,10 @@ async def handle_paypal_start(chat_id, price, cb_id, msg_id):
     order_id, approve_url = await paypal_create_order(price)
     pkg = PACKAGES[price]
     text = (
-        f"💰 <b>Płatność PayPal</b>\n\n"
-        f"Pakiet: <b>{pkg['label']}</b>\n\n"
+        f"💰 Płatność PayPal\n\n"
+        f"Pakiet: {pkg['label']}\n\n"
         f'Kliknij link, aby zapłacić:\n'
-        f'<a href="{approve_url}">🔗 Zapłać przez PayPal</a>\n\n'
+        f'🔗 Zapłać przez PayPal\n\n'
         f"Po zapłaceniu kliknij przycisk:"
     )
     await send_message(chat_id, text, paypal_paid_keyboard(order_id, price))
@@ -181,7 +188,7 @@ async def handle_paypal_check(chat_id, order_id, price, cb_id, msg_id):
     if paid:
         await remove_buttons(chat_id, msg_id)
         link = PACKAGES[price]["link"]
-        await send_message(chat_id, f"✅ <b>Płatność potwierdzona!</b>\n\nOto Twój dostęp:\n{link}")
+        await send_message(chat_id, f"✅ Płatność potwierdzona!\n\nOto Twój dostęp:\n{link}")
     else:
         await send_message(chat_id, "⚠️ Płatność jeszcze nie doszła.\n\nOtwórz link powyżej, zapłać i kliknij przycisk ponownie.")
 
@@ -192,19 +199,21 @@ async def handle_paid(chat_id, price, cb_id, username, msg_id):
     await send_message(chat_id, "⏳ Czekaj na weryfikację...")
     owner_id = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
     pkg = PACKAGES[price]
-    text = f"💰 <b>Nowa płatność do weryfikacji</b>\n\nUżytkownik: <b>{username}</b>\nPakiet: <b>{pkg['label']}</b>\n\nCzy potwierdzasz?"
+    text = f"💰 Nowa płatność do weryfikacji\n\nUżytkownik: {username}\nPakiet: {pkg['label']}\n\nCzy potwierdzasz?"
     await send_message(owner_id, text, admin_keyboard(chat_id, price))
 
 
 async def handle_confirm(user_chat_id, price, cb_id, admin_chat_id, msg_id):
     await answer_callback(cb_id, "Płatność potwierdzona ✅")
     link = PACKAGES[price]["link"]
-    await send_message(user_chat_id, f"✅ <b>Płatność potwierdzona!</b>\n\nOto Twój dostęp:\n{link}")
+    await send_message(user_chat_id, f"✅ Płatność potwierdzona!\n\nOto Twój dostęp:\n{link}")
+    asyncio.create_task(delayed_remove_buttons(admin_chat_id, msg_id, 300))
 
 
 async def handle_reject(user_chat_id, cb_id, admin_chat_id, msg_id):
     await answer_callback(cb_id, "Płatność odrzucona ❌")
     await send_message(user_chat_id, "❌ Płatność nie została potwierdzona.\n\nSkontaktuj się z administratorem lub spróbuj ponownie.")
+    asyncio.create_task(delayed_remove_buttons(admin_chat_id, msg_id, 300))
 
 
 # ── Webhook ──
