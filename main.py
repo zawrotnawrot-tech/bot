@@ -134,8 +134,14 @@ def blik_paid_keyboard(price: str):
     return {"inline_keyboard": [[{"text": "✅ Zapłaciłem", "callback_data": f"paid:{price}"}]]}
 
 
-def paypal_paid_keyboard(order_id: str, price: str):
-    return {"inline_keyboard": [[{"text": "✅ Zapłaciłem (PayPal)", "callback_data": f"ppck:{order_id}:{price}"}]]}
+def paypal_buttons(order_id: str, price: str, approve_url: str):
+    """Inline keyboard with PayPal pay button (URL) + confirm button."""
+    return {
+        "inline_keyboard": [
+            [{"text": "💳 Zapłać przez PayPal", "url": approve_url}],
+            [{"text": "✅ Zapłaciłem (PayPal)", "callback_data": f"ppck:{order_id}:{price}"}],
+        ]
+    }
 
 
 def admin_keyboard(user_chat_id: int, price: str):
@@ -175,11 +181,10 @@ async def handle_paypal_start(chat_id, price, cb_id, msg_id):
     text = (
         f"💰 Płatność PayPal\n\n"
         f"Pakiet: {pkg['label']}\n\n"
-        f'Kliknij link, aby zapłacić:\n'
-        f'🔗 Zapłać przez PayPal\n\n'
-        f"Po zapłaceniu kliknij przycisk:"
+        f"Kliknij przycisk poniżej, aby zapłacić przez PayPal.\n"
+        f"Po zapłaceniu kliknij ✅ Zapłaciłem."
     )
-    await send_message(chat_id, text, paypal_paid_keyboard(order_id, price))
+    await send_message(chat_id, text, paypal_buttons(order_id, price, approve_url))
 
 
 async def handle_paypal_check(chat_id, order_id, price, cb_id, msg_id):
