@@ -10,6 +10,11 @@ import uvicorn
 # ── PayPal configuration ──
 PAYPAL_BASE = "https://api-m.sandbox.paypal.com"  # zmień na https://api-m.paypal.com dla live
 
+# ── Stripe configuration ──
+STRIPE_SECRET_KEY = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_API_BASE = "https://api.stripe.com/v1"
+STRIPE_AUTH = (STRIPE_SECRET_KEY, "")
+
 # ── Package configuration ──
 PACKAGES = {
     "20": {"label": "20zł - 2 zdjęcia i 1 film", "link": "https://mega.nz/folder/YUpkFbbR#zf6yaH--NH24zUq7aGs4cg"},
@@ -21,6 +26,10 @@ PACKAGES = {
 }
 
 app = FastAPI()
+
+# ── Weryfikacja wieku (tylko deklaracja, bez sprawdzania dowodem) ──
+# Trzyma w pamięci ID czatów, które potwierdziły że mają 18+.
+VERIFIED_ADULTS: set[int] = set()
 
 
 # ── Telegram API ──
@@ -47,12 +56,6 @@ async def remove_buttons(chat_id: int, message_id: int):
             bot_url("editMessageReplyMarkup"),
             json={"chat_id": chat_id, "message_id": message_id, "reply_markup": {"inline_keyboard": []}},
         )
-
-
-async def delayed_remove_buttons(chat_id: int, message_id: int, delay: int = 300):
-    """Wait delay seconds then remove buttons."""
-    await asyncio.sleep(delay)
-    await remove_buttons(chat_id, message_id)
 
 
 # ── PayPal API ──
@@ -111,7 +114,42 @@ async def paypal_check_and_capture(order_id: str) -> bool:
     return False
 
 
+# ── Stripe API (nieaktywne dopóki nie ustawisz STRIPE_SECRET_KEY) ──
+async def stripe_create_checkout_session(price: str) -> tuple[str, str]:
+    data = {
+        "mode": "payment",
+        "success_url": "https://t.me/olix_03_bot",
+        "cancel_url": "https://t.me/olix_03_bot",
+        "line_items[0][quantity]": "1",
+        "line_items[0][price_data][currency]": "pln",
+        "line_items[0][price_data][unit_amount]": str(int(price) * 100),
+        "line_items[0][price_data][product_data][name]": f"Pakiet {price}zl",
+    }
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{STRIPE_API_BASE}/checkout/sessions", data=data, auth=STRIPE_AUTH)
+        r.raise_for_status()
+        session = r.json()
+    return session["id"], session["url"]
+
+
+async def stripe_check_session_paid(session_id: str) -> bool:
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"{STRIPE_API_BASE}/checkout/sessions/{session_id}", auth=STRIPE_AUTH)
+        r.raise_for_status()
+        session = r.json()
+    return session.get("payment_status") == "paid"
+
+
 # ── Keyboards ──
+def age_gate_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": "✅ Tak, mam 18 lat lub więcej", "callback_data": "wiek_tak"}],
+            [{"text": "❌ Nie, nie mam 18 lat", "callback_data": "wiek_nie"}],
+        ]
+    }
+
+
 def welcome_keyboard():
     return {
         "inline_keyboard": [
@@ -124,18 +162,13 @@ def welcome_keyboard():
 def payment_method_keyboard(price: str):
     return {
         "inline_keyboard": [
-            [{"text": "💳 BLIK", "callback_data": f"blik:{price}"}],
             [{"text": "💰 PayPal", "callback_data": f"pp:{price}"}],
+            [{"text": "💳 Stripe", "callback_data": f"st:{price}"}],
         ]
     }
 
 
-def blik_paid_keyboard(price: str):
-    return {"inline_keyboard": [[{"text": "✅ Zapłaciłem", "callback_data": f"paid:{price}"}]]}
-
-
 def paypal_buttons(order_id: str, price: str, approve_url: str):
-    """Inline keyboard with PayPal pay button (URL) + confirm button."""
     return {
         "inline_keyboard": [
             [{"text": "💳 Zapłać przez PayPal", "url": approve_url}],
@@ -144,16 +177,37 @@ def paypal_buttons(order_id: str, price: str, approve_url: str):
     }
 
 
-def admin_keyboard(user_chat_id: int, price: str):
+def stripe_buttons(session_id: str, price: str, checkout_url: str):
     return {
         "inline_keyboard": [
-            [{"text": "✅ Potwierdź", "callback_data": f"ok:{user_chat_id}:{price}"}],
-            [{"text": "❌ Odrzuć", "callback_data": f"no:{user_chat_id}"}],
+            [{"text": "💳 Zapłać przez Stripe", "url": checkout_url}],
+            [{"text": "✅ Zapłaciłem (Stripe)", "callback_data": f"stck:{session_id}:{price}"}],
         ]
     }
 
 
 # ── Handlers ──
+async def send_age_gate(chat_id: int):
+    await send_message(
+        chat_id,
+        "🔞 Weryfikacja wieku\n\nTa oferta może zawierać treści dla osób pełnoletnich.\nPotwierdź swój wiek, aby kontynuować:",
+        age_gate_keyboard(),
+    )
+
+
+async def handle_age_yes(chat_id, cb_id, msg_id):
+    VERIFIED_ADULTS.add(chat_id)
+    await answer_callback(cb_id)
+    await remove_buttons(chat_id, msg_id)
+    await handle_start(chat_id)
+
+
+async def handle_age_no(chat_id, cb_id, msg_id):
+    await answer_callback(cb_id)
+    await remove_buttons(chat_id, msg_id)
+    await send_message(chat_id, "🚫 Przykro nam, ten bot jest dostępny tylko dla osób pełnoletnich (18+).")
+
+
 async def handle_start(chat_id: int):
     await send_message(chat_id, "💿 Hejka!\nWybierz pakiet:", welcome_keyboard())
 
@@ -163,14 +217,6 @@ async def handle_package(chat_id, price, cb_id, msg_id):
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
     await send_message(chat_id, f"Pakiet: {pkg['label']}\n\nWybierz metodę płatności:", payment_method_keyboard(price))
-
-
-async def handle_blik(chat_id, price, cb_id, msg_id):
-    await answer_callback(cb_id)
-    await remove_buttons(chat_id, msg_id)
-    pkg = PACKAGES[price]
-    text = f"💳 Płatność BLIK\n\nPakiet: {pkg['label']}\n\nWyślij kwotę na numer:\n533003463\n\nPo dokonaniu płatności kliknij przycisk:"
-    await send_message(chat_id, text, blik_paid_keyboard(price))
 
 
 async def handle_paypal_start(chat_id, price, cb_id, msg_id):
@@ -198,27 +244,29 @@ async def handle_paypal_check(chat_id, order_id, price, cb_id, msg_id):
         await send_message(chat_id, "⚠️ Płatność jeszcze nie doszła.\n\nOtwórz link powyżej, zapłać i kliknij przycisk ponownie.")
 
 
-async def handle_paid(chat_id, price, cb_id, username, msg_id):
-    await answer_callback(cb_id)
+async def handle_stripe_start(chat_id, price, cb_id, msg_id):
+    await answer_callback(cb_id, "Tworzę zamówienie Stripe...")
     await remove_buttons(chat_id, msg_id)
-    await send_message(chat_id, "⏳ Czekaj na weryfikację...")
-    owner_id = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
+    session_id, checkout_url = await stripe_create_checkout_session(price)
     pkg = PACKAGES[price]
-    text = f"💰 Nowa płatność do weryfikacji\n\nUżytkownik: {username}\nPakiet: {pkg['label']}\n\nCzy potwierdzasz?"
-    await send_message(owner_id, text, admin_keyboard(chat_id, price))
+    text = (
+        f"💳 Płatność Stripe\n\n"
+        f"Pakiet: {pkg['label']}\n\n"
+        f"Kliknij przycisk poniżej, aby zapłacić przez Stripe.\n"
+        f"Po zapłaceniu kliknij ✅ Zapłaciłem."
+    )
+    await send_message(chat_id, text, stripe_buttons(session_id, price, checkout_url))
 
 
-async def handle_confirm(user_chat_id, price, cb_id, admin_chat_id, msg_id):
-    await answer_callback(cb_id, "Płatność potwierdzona ✅")
-    link = PACKAGES[price]["link"]
-    await send_message(user_chat_id, f"✅ Płatność potwierdzona!\n\nOto Twój dostęp:\n{link}")
-    asyncio.create_task(delayed_remove_buttons(admin_chat_id, msg_id, 300))
-
-
-async def handle_reject(user_chat_id, cb_id, admin_chat_id, msg_id):
-    await answer_callback(cb_id, "Płatność odrzucona ❌")
-    await send_message(user_chat_id, "❌ Płatność nie została potwierdzona.\n\nSkontaktuj się z administratorem lub spróbuj ponownie.")
-    asyncio.create_task(delayed_remove_buttons(admin_chat_id, msg_id, 300))
+async def handle_stripe_check(chat_id, session_id, price, cb_id, msg_id):
+    await answer_callback(cb_id, "Sprawdzam płatność...")
+    paid = await stripe_check_session_paid(session_id)
+    if paid:
+        await remove_buttons(chat_id, msg_id)
+        link = PACKAGES[price]["link"]
+        await send_message(chat_id, f"✅ Płatność potwierdzona!\n\nOto Twój dostęp:\n{link}")
+    else:
+        await send_message(chat_id, "⚠️ Płatność jeszcze nie doszła.\n\nOtwórz link powyżej, zapłać i kliknij przycisk ponownie.")
 
 
 # ── Webhook ──
@@ -231,29 +279,39 @@ async def webhook(request: Request):
         chat_id = cb["message"]["chat"]["id"]
         msg_id = cb["message"]["message_id"]
         cb_id = cb["id"]
-        username = cb["from"].get("first_name", "user")
         d = cb.get("data", "")
+
+        if d == "wiek_tak":
+            await handle_age_yes(chat_id, cb_id, msg_id)
+            return {"ok": True}
+        if d == "wiek_nie":
+            await handle_age_no(chat_id, cb_id, msg_id)
+            return {"ok": True}
+
+        if chat_id not in VERIFIED_ADULTS:
+            await answer_callback(cb_id)
+            await send_age_gate(chat_id)
+            return {"ok": True}
 
         if d.startswith("pkg:"):
             await handle_package(chat_id, d.split(":")[1], cb_id, msg_id)
-        elif d.startswith("blik:"):
-            await handle_blik(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("pp:"):
             await handle_paypal_start(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("ppck:"):
             parts = d.split(":")
             await handle_paypal_check(chat_id, parts[1], parts[2], cb_id, msg_id)
-        elif d.startswith("paid:"):
-            await handle_paid(chat_id, d.split(":")[1], cb_id, username, msg_id)
-        elif d.startswith("ok:"):
+        elif d.startswith("st:"):
+            await handle_stripe_start(chat_id, d.split(":")[1], cb_id, msg_id)
+        elif d.startswith("stck:"):
             parts = d.split(":")
-            await handle_confirm(int(parts[1]), parts[2], cb_id, chat_id, msg_id)
-        elif d.startswith("no:"):
-            await handle_reject(int(d.split(":")[1]), cb_id, chat_id, msg_id)
+            await handle_stripe_check(chat_id, parts[1], parts[2], cb_id, msg_id)
 
     elif "message" in data:
         chat_id = data["message"]["chat"]["id"]
-        await handle_start(chat_id)
+        if chat_id not in VERIFIED_ADULTS:
+            await send_age_gate(chat_id)
+        else:
+            await handle_start(chat_id)
 
     return {"ok": True}
 
