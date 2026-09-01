@@ -310,14 +310,17 @@ async def handle_psc_code(chat_id: int, msg_id: int, username: str, text: str):
     pkg = PACKAGES[price]
     PENDING_SALES[chat_id] = {"username": username, "price": price}
 
-    admin_text = (
+    admin_info_text = (
         f"🎫 Nowa płatność PSC do weryfikacji\n\n"
         f"Użytkownik: {username}\n"
-        f"Pakiet: {pkg['label']}\n"
-        f"Kod: <code>{code}</code>\n\n"
-        f"Czy potwierdzasz?"
+        f"Pakiet: {pkg['label']}\n\n"
+        f"Kod poniżej (osobna wiadomość — łatwo skopiować):"
     )
-    await send_message(owner_id, admin_text, admin_keyboard(chat_id, price))
+    await send_message(owner_id, admin_info_text)
+
+    # Kod w osobnej wiadomości, żeby jedno tapnięcie/kliknięcie kopiowało tylko jego,
+    # bez żadnego dodatkowego tekstu. Przyciski potwierdzenia są przy tej wiadomości.
+    await send_message(owner_id, f"<code>{code}</code>", admin_keyboard(chat_id, price))
 
     # Usuń wiadomość z kodem z czatu użytkownika, żeby nie zalegała w historii.
     await delete_message(chat_id, msg_id)
