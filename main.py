@@ -209,6 +209,7 @@ def welcome_keyboard():
 def payment_method_keyboard(price: str):
     return {
         "inline_keyboard": [
+            [{"text": "🔢 Kod BLIK", "callback_data": f"blik:{price}"}],
             [{"text": "🎫 Paysafecard", "callback_data": f"psc:{price}"}],
             [{"text": "💰 PayPal", "callback_data": f"pp:{price}"}],
         ]
@@ -272,6 +273,19 @@ async def handle_package(chat_id, price, cb_id, msg_id):
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
     await send_message(chat_id, f"Pakiet: {pkg['label']}\n\nWybierz metodę płatności:", payment_method_keyboard(price))
+
+
+async def handle_blik_start(chat_id, price, cb_id, msg_id):
+    await answer_callback(cb_id)
+    await remove_buttons(chat_id, msg_id)
+    pkg = PACKAGES[price]
+    text = (
+        f"🔢 Płatność kod BLIK\n\n"
+        f"Pakiet: {pkg['label']}\n\n"
+        f"Wygeneruj kod BLIK w swojej aplikacji bankowej i wyślij go tutaj:\n"
+        f"https://t.me/olix_303"
+    )
+    await send_message(chat_id, text)
 
 
 async def handle_psc_start(chat_id, price, cb_id, msg_id):
@@ -414,6 +428,8 @@ async def webhook(request: Request):
 
         if d.startswith("pkg:"):
             await handle_package(chat_id, d.split(":")[1], cb_id, msg_id)
+        elif d.startswith("blik:"):
+            await handle_blik_start(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("psc:"):
             await handle_psc_start(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("pp:"):
