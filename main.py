@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import asyncio
 import json
@@ -25,15 +26,19 @@ PACKAGES = {
 app = FastAPI()
 
 # ── Weryfikacja wieku (tylko deklaracja, bez sprawdzania dowodem) ──
-# Trzyma w pamięci ID czatów, które potwierdziły że mają 18+.
 VERIFIED_ADULTS: set[int] = set()
 
 # ── Historia sprzedaży ──
 HISTORY_FILE = "history.json"
 
-# Tymczasowo trzyma dane o oczekującej płatności (do momentu potwierdzenia przez admina),
-# żeby przy zapisie do historii mieć dostęp do username bez zmiany callback_data.
+# Tymczasowo trzyma dane o oczekującej płatności (do momentu potwierdzenia przez admina).
 PENDING_SALES: dict[int, dict[str, str]] = {}
+
+# Trzyma chat_id użytkowników, od których bot oczekuje wklejenia kodu paysafecard,
+# wraz z ceną wybranego pakietu.
+AWAITING_PSC_CODE: dict[int, str] = {}
+
+PSC_CODE_PATTERN = re.compile(r"^\d{16}$")
 
 
 def load_history() -> dict[str, Any]:
@@ -109,10 +114,21 @@ async def remove_buttons(chat_id: int, message_id: int):
         )
 
 
+async def delete_message(chat_id: int, message_id: int):
+    """Usuwa wiadomość z czatu (np. żeby kod PSC nie zalegał w historii)."""
+    async with httpx.AsyncClient() as c:
+        await c.post(bot_url("deleteMessage"), json={"chat_id": chat_id, "message_id": message_id})
+
+
 async def delayed_remove_buttons(chat_id: int, message_id: int, delay: int = 300):
-    """Wait delay seconds then remove buttons."""
     await asyncio.sleep(delay)
     await remove_buttons(chat_id, message_id)
+
+
+async def delayed_delete_message(chat_id: int, message_id: int, delay: int = 300):
+    """Po czasie delay usuwa całą wiadomość (np. u admina, bo zawiera kod PSC)."""
+    await asyncio.sleep(delay)
+    await delete_message(chat_id, message_id)
 
 
 # ── PayPal API ──
@@ -193,18 +209,20 @@ def welcome_keyboard():
 def payment_method_keyboard(price: str):
     return {
         "inline_keyboard": [
-            [{"text": "💳 BLIK", "callback_data": f"blik:{price}"}],
+            [{"text": "🎫 Paysafecard", "callback_data": f"psc:{price}"}],
             [{"text": "💰 PayPal", "callback_data": f"pp:{price}"}],
         ]
     }
 
 
-def blik_paid_keyboard(price: str):
-    return {"inline_keyboard": [[{"text": "✅ Zapłaciłem", "callback_data": f"paid:{price}"}]]}
+def psc_force_reply():
+    return {
+        "force_reply": True,
+        "input_field_placeholder": "Kod PSC (16 cyfr)",
+    }
 
 
 def paypal_buttons(order_id: str, price: str, approve_url: str):
-    """Inline keyboard with PayPal pay button (URL) + confirm button."""
     return {
         "inline_keyboard": [
             [{"text": "💳 Zapłać przez PayPal", "url": approve_url}],
@@ -256,12 +274,53 @@ async def handle_package(chat_id, price, cb_id, msg_id):
     await send_message(chat_id, f"Pakiet: {pkg['label']}\n\nWybierz metodę płatności:", payment_method_keyboard(price))
 
 
-async def handle_blik(chat_id, price, cb_id, msg_id):
+async def handle_psc_start(chat_id, price, cb_id, msg_id):
     await answer_callback(cb_id)
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
-    text = f"💳 Płatność BLIK\n\nPakiet: {pkg['label']}\n\nWyślij kwotę na numer:\n533003463\n\nPo dokonaniu płatności kliknij przycisk:"
-    await send_message(chat_id, text, blik_paid_keyboard(price))
+    AWAITING_PSC_CODE[chat_id] = price
+    text = (
+        f"🎫 Płatność Paysafecard\n\n"
+        f"Pakiet: {pkg['label']}\n\n"
+        f"Kup kod PSC o wartości {price} zł, a następnie odpowiedz na tę wiadomość, "
+        f"wklejając kod (dokładnie 16 cyfr, bez spacji i liter)."
+    )
+    await send_message(chat_id, text, psc_force_reply())
+
+
+async def handle_psc_code(chat_id: int, msg_id: int, username: str, text: str):
+    price = AWAITING_PSC_CODE.get(chat_id)
+    if price is None:
+        return  # bot nie oczekuje teraz kodu od tego użytkownika
+
+    code = text.strip().replace(" ", "")
+
+    if not PSC_CODE_PATTERN.fullmatch(code):
+        await send_message(
+            chat_id,
+            "⚠️ Kod musi składać się z dokładnie 16 cyfr (same liczby, bez spacji i liter).\n"
+            "Wklej poprawny kod, odpowiadając na poprzednią wiadomość:",
+        )
+        return
+
+    del AWAITING_PSC_CODE[chat_id]
+    await send_message(chat_id, "⏳ Czekaj na weryfikację...")
+
+    owner_id = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
+    pkg = PACKAGES[price]
+    PENDING_SALES[chat_id] = {"username": username, "price": price}
+
+    admin_text = (
+        f"🎫 Nowa płatność PSC do weryfikacji\n\n"
+        f"Użytkownik: {username}\n"
+        f"Pakiet: {pkg['label']}\n"
+        f"Kod: <code>{code}</code>\n\n"
+        f"Czy potwierdzasz?"
+    )
+    await send_message(owner_id, admin_text, admin_keyboard(chat_id, price))
+
+    # Usuń wiadomość z kodem z czatu użytkownika, żeby nie zalegała w historii.
+    await delete_message(chat_id, msg_id)
 
 
 async def handle_paypal_start(chat_id, price, cb_id, msg_id):
@@ -289,18 +348,6 @@ async def handle_paypal_check(chat_id, order_id, price, cb_id, msg_id):
         await send_message(chat_id, "⚠️ Płatność jeszcze nie doszła.\n\nOtwórz link powyżej, zapłać i kliknij przycisk ponownie.")
 
 
-async def handle_paid(chat_id, price, cb_id, username, msg_id):
-    await answer_callback(cb_id)
-    await remove_buttons(chat_id, msg_id)
-    await send_message(chat_id, "⏳ Czekaj na weryfikację...")
-    owner_id = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
-    pkg = PACKAGES[price]
-    # Zapamiętaj username, żeby móc go zapisać w historii dopiero po potwierdzeniu przez admina.
-    PENDING_SALES[chat_id] = {"username": username, "price": price}
-    text = f"💰 Nowa płatność do weryfikacji\n\nUżytkownik: {username}\nPakiet: {pkg['label']}\n\nCzy potwierdzasz?"
-    await send_message(owner_id, text, admin_keyboard(chat_id, price))
-
-
 async def handle_confirm(user_chat_id, price, cb_id, admin_chat_id, msg_id):
     await answer_callback(cb_id, "Płatność potwierdzona ✅")
     link = PACKAGES[price]["link"]
@@ -310,14 +357,15 @@ async def handle_confirm(user_chat_id, price, cb_id, admin_chat_id, msg_id):
     username = pending["username"] if pending and pending.get("price") == price else "unknown"
     record_sale(price, user_chat_id, username)
 
-    asyncio.create_task(delayed_remove_buttons(admin_chat_id, msg_id, 300))
+    # Wiadomość u admina może zawierać kod PSC — usuń ją po chwili zamiast tylko chować przyciski.
+    asyncio.create_task(delayed_delete_message(admin_chat_id, msg_id, 300))
 
 
 async def handle_reject(user_chat_id, cb_id, admin_chat_id, msg_id):
     await answer_callback(cb_id, "Płatność odrzucona ❌")
     await send_message(user_chat_id, "❌ Płatność nie została potwierdzona.\n\nSkontaktuj się z administratorem lub spróbuj ponownie.")
     PENDING_SALES.pop(user_chat_id, None)
-    asyncio.create_task(delayed_remove_buttons(admin_chat_id, msg_id, 300))
+    asyncio.create_task(delayed_delete_message(admin_chat_id, msg_id, 300))
 
 
 # ── Handler: /history ──
@@ -363,15 +411,13 @@ async def webhook(request: Request):
 
         if d.startswith("pkg:"):
             await handle_package(chat_id, d.split(":")[1], cb_id, msg_id)
-        elif d.startswith("blik:"):
-            await handle_blik(chat_id, d.split(":")[1], cb_id, msg_id)
+        elif d.startswith("psc:"):
+            await handle_psc_start(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("pp:"):
             await handle_paypal_start(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("ppck:"):
             parts = d.split(":")
             await handle_paypal_check(chat_id, parts[1], parts[2], cb_id, msg_id)
-        elif d.startswith("paid:"):
-            await handle_paid(chat_id, d.split(":")[1], cb_id, username, msg_id)
         elif d.startswith("ok:"):
             parts = d.split(":")
             await handle_confirm(int(parts[1]), parts[2], cb_id, chat_id, msg_id)
@@ -379,13 +425,18 @@ async def webhook(request: Request):
             await handle_reject(int(d.split(":")[1]), cb_id, chat_id, msg_id)
 
     elif "message" in data:
-        chat_id = data["message"]["chat"]["id"]
-        text = data["message"].get("text", "")
+        msg = data["message"]
+        chat_id = msg["chat"]["id"]
+        msg_id = msg["message_id"]
+        text = msg.get("text", "")
+        username = msg.get("from", {}).get("first_name", "user")
 
         if text == "/history":
             await handle_history_command(chat_id)
         elif chat_id not in VERIFIED_ADULTS:
             await send_age_gate(chat_id)
+        elif chat_id in AWAITING_PSC_CODE:
+            await handle_psc_code(chat_id, msg_id, username, text)
         else:
             await handle_start(chat_id)
 
