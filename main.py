@@ -209,7 +209,7 @@ def welcome_keyboard():
 def payment_method_keyboard(price: str):
     return {
         "inline_keyboard": [
-            [{"text": "🔢 Kod BLIK", "callback_data": f"blik:{price}"}],
+            [{"text": "💳 BLIK", "callback_data": f"blik:{price}"}],
             [{"text": "🎫 Paysafecard", "callback_data": f"psc:{price}"}],
             [{"text": "💰 PayPal", "callback_data": f"pp:{price}"}],
         ]
@@ -221,6 +221,10 @@ def psc_force_reply():
         "force_reply": True,
         "input_field_placeholder": "Kod PSC (16 cyfr)",
     }
+
+
+def blik_paid_keyboard(price: str):
+    return {"inline_keyboard": [[{"text": "✅ Zapłaciłem", "callback_data": f"paid:{price}"}]]}
 
 
 def paypal_buttons(order_id: str, price: str, approve_url: str):
@@ -279,13 +283,19 @@ async def handle_blik_start(chat_id, price, cb_id, msg_id):
     await answer_callback(cb_id)
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
-    text = (
-        f"🔢 Płatność kod BLIK\n\n"
-        f"Pakiet: {pkg['label']}\n\n"
-        f"Wygeneruj kod BLIK w swojej aplikacji bankowej i wyślij go tutaj:\n"
-        f"https://t.me/olix_303"
-    )
-    await send_message(chat_id, text)
+    text = f"💳 Płatność BLIK\n\nPakiet: {pkg['label']}\n\nWyślij kwotę na numer:\n533003463\n\nPo dokonaniu płatności kliknij przycisk:"
+    await send_message(chat_id, text, blik_paid_keyboard(price))
+
+
+async def handle_paid(chat_id, price, cb_id, username, msg_id):
+    await answer_callback(cb_id)
+    await remove_buttons(chat_id, msg_id)
+    await send_message(chat_id, "⏳ Czekaj na weryfikację...")
+    owner_id = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
+    pkg = PACKAGES[price]
+    PENDING_SALES[chat_id] = {"username": username, "price": price}
+    text = f"💰 Nowa płatność do weryfikacji\n\nUżytkownik: {username}\nPakiet: {pkg['label']}\n\nCzy potwierdzasz?"
+    await send_message(owner_id, text, admin_keyboard(chat_id, price))
 
 
 async def handle_psc_start(chat_id, price, cb_id, msg_id):
@@ -437,6 +447,8 @@ async def webhook(request: Request):
         elif d.startswith("ppck:"):
             parts = d.split(":")
             await handle_paypal_check(chat_id, parts[1], parts[2], cb_id, msg_id)
+        elif d.startswith("paid:"):
+            await handle_paid(chat_id, d.split(":")[1], cb_id, username, msg_id)
         elif d.startswith("ok:"):
             parts = d.split(":")
             await handle_confirm(int(parts[1]), parts[2], cb_id, chat_id, msg_id)
