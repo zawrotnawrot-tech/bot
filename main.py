@@ -3,7 +3,8 @@ import asyncio
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
+from fastapi.responses import JSONResponse
 import uvicorn
 
 # ── Package configuration ──
@@ -17,6 +18,16 @@ PACKAGES = {
 }
 
 TIPPLY_LINK = "https://tipply.pl/@olcia_020"
+
+# Sekret ustawiony w Telegramie przez setWebhook (parametr secret_token).
+# Telegram odsyła go w nagłówku X-Telegram-Bot-Api-Secret-Token przy KAŻDYM
+# requeście na webhook — jeśli się nie zgadza, request nie pochodzi od
+# Telegrama i jest odrzucany.
+WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
+
+# ID właściciela wczytywane raz przy starcie, żeby uniknąć powtarzania
+# int(os.environ[...]) w każdym handlerze.
+OWNER_CHAT_ID = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
 
 app = FastAPI()
 
@@ -113,10 +124,9 @@ async def handle_paid(chat_id, price, cb_id, username, msg_id):
     await answer_callback(cb_id)
     await remove_buttons(chat_id, msg_id)
     await send_message(chat_id, "⏳ Czekaj na weryfikację...")
-    owner_id = int(os.environ["TELEGRAM_OWNER_CHAT_ID"])
     pkg = PACKAGES[price]
     text = f"💰 Nowa płatność do weryfikacji\n\nUżytkownik: {username}\nPakiet: {pkg['label']} ({price}zł)\n\nCzy potwierdzasz?"
-    await send_message(owner_id, text, admin_keyboard(chat_id, price))
+    await send_message(OWNER_CHAT_ID, text, admin_keyboard(chat_id, price))
 
 
 async def handle_confirm(user_chat_id, price, cb_id, admin_chat_id, msg_id):
@@ -134,7 +144,17 @@ async def handle_reject(user_chat_id, cb_id, admin_chat_id, msg_id):
 
 # ── Webhook ──
 @app.post("/webhook")
-async def webhook(request: Request):
+async def webhook(
+    request: Request,
+    x_telegram_bot_api_secret_token: str | None = Header(default=None),
+):
+    # 1) Odrzuć każdy request, który nie ma poprawnego sekretu Telegrama.
+    #    Bez tego ktokolwiek znający adres /webhook mógłby wysłać własny,
+    #    spreparowany JSON i np. udawać "ok:TWOJ_CHAT_ID:100", pomijając
+    #    Ciebie jako weryfikatora płatności.
+    if x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+        return JSONResponse(status_code=403, content={"ok": False})
+
     data = await request.json()
 
     if "callback_query" in data:
@@ -142,20 +162,38 @@ async def webhook(request: Request):
         chat_id = cb["message"]["chat"]["id"]
         msg_id = cb["message"]["message_id"]
         cb_id = cb["id"]
+        sender_id = cb["from"]["id"]
         username = cb["from"].get("first_name", "user")
         d = cb.get("data", "")
 
         if d.startswith("pkg:"):
-            await handle_package(chat_id, d.split(":")[1], cb_id, msg_id)
+            price = d.split(":")[1]
+            if price in PACKAGES:
+                await handle_package(chat_id, price, cb_id, msg_id)
         elif d.startswith("pay:"):
-            await handle_pay(chat_id, d.split(":")[1], cb_id, msg_id)
+            price = d.split(":")[1]
+            if price in PACKAGES:
+                await handle_pay(chat_id, price, cb_id, msg_id)
         elif d.startswith("paid:"):
-            await handle_paid(chat_id, d.split(":")[1], cb_id, username, msg_id)
+            price = d.split(":")[1]
+            if price in PACKAGES:
+                await handle_paid(chat_id, price, cb_id, username, msg_id)
         elif d.startswith("ok:"):
+            # 2) Nawet gdyby ktoś zdobył sekret, tylko konto właściciela
+            #    (Twoje) może potwierdzać lub odrzucać płatności.
+            if sender_id != OWNER_CHAT_ID:
+                await answer_callback(cb_id, "Brak uprawnień.")
+                return {"ok": True}
             parts = d.split(":")
-            await handle_confirm(int(parts[1]), parts[2], cb_id, chat_id, msg_id)
+            user_chat_id, price = int(parts[1]), parts[2]
+            if price in PACKAGES:
+                await handle_confirm(user_chat_id, price, cb_id, chat_id, msg_id)
         elif d.startswith("no:"):
-            await handle_reject(int(d.split(":")[1]), cb_id, chat_id, msg_id)
+            if sender_id != OWNER_CHAT_ID:
+                await answer_callback(cb_id, "Brak uprawnień.")
+                return {"ok": True}
+            user_chat_id = int(d.split(":")[1])
+            await handle_reject(user_chat_id, cb_id, chat_id, msg_id)
 
     elif "message" in data:
         chat_id = data["message"]["chat"]["id"]
