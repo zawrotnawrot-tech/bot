@@ -94,8 +94,13 @@ async def delayed_remove_buttons(chat_id: int, message_id: int, delay: int = 300
 
 
 # ── Klawiatury ──
-def pay_keyboard():
-    return {"inline_keyboard": [[{"text": "💸 Zapłać", "callback_data": "pay"}]]}
+def welcome_keyboard():
+    return {
+        "inline_keyboard": [
+            [{"text": pkg["label"], "callback_data": f"pkg:{price}"}]
+            for price, pkg in PACKAGES.items()
+        ]
+    }
 
 
 def admin_choose_package_keyboard(code: str):
@@ -106,18 +111,20 @@ def admin_choose_package_keyboard(code: str):
 
 # ── Handlery Telegram ──
 async def handle_start(chat_id: int):
-    await send_message(chat_id, "💿 Hejka!", pay_keyboard())
+    await send_message(chat_id, "💿 Hejka!\nWybierz pakiet:", welcome_keyboard())
 
 
-async def handle_pay(chat_id: int, cb_id: str, username: str, msg_id: int):
-    await answer_callback(cb_id)
+async def handle_package(chat_id: int, price: str, cb_id: str, username: str, msg_id: int):
+    await answer_callback(cb_id, f"Wybrałeś pakiet za {price}zł")
     await remove_buttons(chat_id, msg_id)
 
+    pkg = PACKAGES[price]
     code = generate_order_code()
-    ORDERS[code] = {"chat_id": chat_id, "username": username, "status": "pending"}
+    ORDERS[code] = {"chat_id": chat_id, "username": username, "status": "pending", "price": price}
     save_orders()
 
     text = (
+        f"Pakiet: {pkg['label']}\n\n"
         f"💸 Zapłać czym tylko chcesz:\n{TIPPLY_LINK}\n\n"
         f"⚠️ W polu <b>Wiadomość</b> na Tipply wpisz koniecznie ten kod:\n"
         f"<code>{code}</code>\n\n"
@@ -166,8 +173,8 @@ async def telegram_webhook(request: Request):
         username = cb["from"].get("first_name", "user")
         d = cb.get("data", "")
 
-        if d == "pay":
-            await handle_pay(chat_id, cb_id, username, msg_id)
+        if d.startswith("pkg:"):
+            await handle_package(chat_id, d.split(":")[1], cb_id, username, msg_id)
         elif d.startswith("ok2:"):
             parts = d.split(":")
             await handle_admin_confirm(parts[1], parts[2], cb_id, chat_id, msg_id)
