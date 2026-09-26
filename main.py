@@ -1,14 +1,10 @@
 import os
-import base64
 import asyncio
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
 import uvicorn
-
-# ── PayPal configuration ──
-PAYPAL_BASE = "https://api-m.sandbox.paypal.com"  # zmień na https://api-m.paypal.com dla live
 
 # ── Package configuration ──
 PACKAGES = {
@@ -19,6 +15,8 @@ PACKAGES = {
     "100": {"label": "100zł - 20 zdjęć i 10 filmów", "link": "https://mega.nz/folder/wVgQHApI#Z8k-PSDN-fqeU_4DYjKenQ"},
     "350": {"label": "350zł - Cały folder (60GB)", "link": "https://mega.nz/folder/wIg2QLrD#xzaf8oGVHJUvgaEiLFPyPg"},
 }
+
+TIPPLY_LINK = "https://tipply.pl/@olcia_020"
 
 app = FastAPI()
 
@@ -55,62 +53,6 @@ async def delayed_remove_buttons(chat_id: int, message_id: int, delay: int = 300
     await remove_buttons(chat_id, message_id)
 
 
-# ── PayPal API ──
-async def paypal_get_token() -> str:
-    cid = os.environ["PAYPAL_CLIENT_ID"]
-    secret = os.environ["PAYPAL_CLIENT_SECRET"]
-    auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
-    async with httpx.AsyncClient() as c:
-        r = await c.post(
-            f"{PAYPAL_BASE}/v1/oauth2/token",
-            headers={"Authorization": f"Basic {auth}"},
-            data={"grant_type": "client_credentials"},
-        )
-        r.raise_for_status()
-        return r.json()["access_token"]
-
-
-async def paypal_create_order(price: str) -> tuple[str, str]:
-    token = await paypal_get_token()
-    body = {
-        "intent": "CAPTURE",
-        "purchase_units": [{"amount": {"currency_code": "PLN", "value": f"{price}.00"}, "description": f"Pakiet {price}zl"}],
-        "application_context": {
-            "brand_name": "olix_303",
-            "user_action": "PAY_NOW",
-            "return_url": "https://t.me/olix_03_bot",
-            "cancel_url": "https://t.me/olix_03_bot",
-        },
-    }
-    async with httpx.AsyncClient() as c:
-        r = await c.post(
-            f"{PAYPAL_BASE}/v2/checkout/orders",
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json=body,
-        )
-        r.raise_for_status()
-        order = r.json()
-    order_id = order["id"]
-    approve_url = next(l["href"] for l in order["links"] if l["rel"] == "approve")
-    return order_id, approve_url
-
-
-async def paypal_check_and_capture(order_id: str) -> bool:
-    token = await paypal_get_token()
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    async with httpx.AsyncClient() as c:
-        status_r = await c.get(f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}", headers=headers)
-        status_r.raise_for_status()
-        status = status_r.json()["status"]
-        if status == "COMPLETED":
-            return True
-        if status == "APPROVED":
-            cap = await c.post(f"{PAYPAL_BASE}/v2/checkout/orders/{order_id}/capture", headers=headers)
-            cap.raise_for_status()
-            return cap.json()["status"] == "COMPLETED"
-    return False
-
-
 # ── Keyboards ──
 def welcome_keyboard():
     return {
@@ -121,21 +63,12 @@ def welcome_keyboard():
     }
 
 
-def payment_method_keyboard(price: str):
-    return {
-        "inline_keyboard": [
-            [{"text": "💳 BLIK", "callback_data": f"blik:{price}"}],
-            [{"text": "💰 PayPal", "callback_data": f"pp:{price}"}],
-        ]
-    }
+def pay_keyboard(price: str):
+    return {"inline_keyboard": [[{"text": "💸 Zapłać", "callback_data": f"pay:{price}"}]]}
 
 
-def blik_paid_keyboard(price: str):
+def paid_keyboard(price: str):
     return {"inline_keyboard": [[{"text": "✅ Zapłaciłem", "callback_data": f"paid:{price}"}]]}
-
-
-def paypal_paid_keyboard(order_id: str, price: str):
-    return {"inline_keyboard": [[{"text": "✅ Zapłaciłem (PayPal)", "callback_data": f"ppck:{order_id}:{price}"}]]}
 
 
 def admin_keyboard(user_chat_id: int, price: str):
@@ -156,41 +89,20 @@ async def handle_package(chat_id, price, cb_id, msg_id):
     await answer_callback(cb_id, f"Wybrałeś pakiet za {price}zł")
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
-    await send_message(chat_id, f"Pakiet: {pkg['label']}\n\nWybierz metodę płatności:", payment_method_keyboard(price))
+    await send_message(chat_id, f"Pakiet: {pkg['label']}\n\nZapłać czym tylko chcesz:", pay_keyboard(price))
 
 
-async def handle_blik(chat_id, price, cb_id, msg_id):
+async def handle_pay(chat_id, price, cb_id, msg_id):
     await answer_callback(cb_id)
     await remove_buttons(chat_id, msg_id)
     pkg = PACKAGES[price]
-    text = f"💳 Płatność BLIK\n\nPakiet: {pkg['label']}\n\nWyślij kwotę na numer:\n533003463\n\nPo dokonaniu płatności kliknij przycisk:"
-    await send_message(chat_id, text, blik_paid_keyboard(price))
-
-
-async def handle_paypal_start(chat_id, price, cb_id, msg_id):
-    await answer_callback(cb_id, "Tworzę zamówienie PayPal...")
-    await remove_buttons(chat_id, msg_id)
-    order_id, approve_url = await paypal_create_order(price)
-    pkg = PACKAGES[price]
     text = (
-        f"💰 Płatność PayPal\n\n"
+        f"💸 Płatność\n\n"
         f"Pakiet: {pkg['label']}\n\n"
-        f'Kliknij link, aby zapłacić:\n'
-        f'🔗 Zapłać przez PayPal\n\n'
-        f"Po zapłaceniu kliknij przycisk:"
+        f"Zapłać tutaj:\n{TIPPLY_LINK}\n\n"
+        f"Po dokonaniu płatności kliknij przycisk:"
     )
-    await send_message(chat_id, text, paypal_paid_keyboard(order_id, price))
-
-
-async def handle_paypal_check(chat_id, order_id, price, cb_id, msg_id):
-    await answer_callback(cb_id, "Sprawdzam płatność...")
-    paid = await paypal_check_and_capture(order_id)
-    if paid:
-        await remove_buttons(chat_id, msg_id)
-        link = PACKAGES[price]["link"]
-        await send_message(chat_id, f"✅ Płatność potwierdzona!\n\nOto Twój dostęp:\n{link}")
-    else:
-        await send_message(chat_id, "⚠️ Płatność jeszcze nie doszła.\n\nOtwórz link powyżej, zapłać i kliknij przycisk ponownie.")
+    await send_message(chat_id, text, paid_keyboard(price))
 
 
 async def handle_paid(chat_id, price, cb_id, username, msg_id):
@@ -231,13 +143,8 @@ async def webhook(request: Request):
 
         if d.startswith("pkg:"):
             await handle_package(chat_id, d.split(":")[1], cb_id, msg_id)
-        elif d.startswith("blik:"):
-            await handle_blik(chat_id, d.split(":")[1], cb_id, msg_id)
-        elif d.startswith("pp:"):
-            await handle_paypal_start(chat_id, d.split(":")[1], cb_id, msg_id)
-        elif d.startswith("ppck:"):
-            parts = d.split(":")
-            await handle_paypal_check(chat_id, parts[1], parts[2], cb_id, msg_id)
+        elif d.startswith("pay:"):
+            await handle_pay(chat_id, d.split(":")[1], cb_id, msg_id)
         elif d.startswith("paid:"):
             await handle_paid(chat_id, d.split(":")[1], cb_id, username, msg_id)
         elif d.startswith("ok:"):
