@@ -20,7 +20,7 @@ PACKAGES = {
 
 # ── Produkty z wysyłką ──
 ITEMS = {
-    "majtki": {"label": "Majtki - 90zł", "button": "🩲 Majtki - 90zł", "price": 90},
+    "majtki": {"label": "Majtki - 40zł", "button": "🩲 Majtki - 40zł", "price": 40},
 }
 
 TIPPLY_LINK = "https://tipply.pl/@olcia_020"
